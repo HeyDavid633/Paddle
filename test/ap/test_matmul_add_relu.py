@@ -22,7 +22,8 @@ import paddle
 import paddle.incubate.cc as pcc
 import paddle.incubate.cc.typing as pct
 
-os.environ["AP_WORKSPACE_DIR"] = "/tmp/paddle/ap"
+# os.environ["AP_WORKSPACE_DIR"] = "/tmp/paddle/ap"
+os.environ["AP_WORKSPACE_DIR"] = "/daiwenhao/Paddle/ap_workspace"
 
 
 def GetPirProgram(fused_func, tensor_args):
@@ -77,6 +78,7 @@ class TestMatmulEpilogue(unittest.TestCase):
             tmp = paddle.nn.functional.relu(y)
             tmp2 = tmp + b
             return tmp2
+        # relu(matmul(x, w)) + b
 
         return foo
 
@@ -91,12 +93,14 @@ class TestMatmulEpilogue(unittest.TestCase):
         self.assertTrue(
             'pd_op.ap_variadic' in generated_pir_program, "fusion failed"
         )
+        # 判断设备，完全是由辅助函数来实现的
         if IsCertainDevices():
             ap_outs = fused_foo(self.x, self.y, self.b)
             dy_outs = foo(self.x, self.y, self.b)
             for dy_out, ap_out in zip(dy_outs, ap_outs):
                 np.testing.assert_allclose(dy_out, ap_out, atol=1e-1)
 
+        print(">>> [DWH INFO] pass !")
 
 if __name__ == "__main__":
     unittest.main()

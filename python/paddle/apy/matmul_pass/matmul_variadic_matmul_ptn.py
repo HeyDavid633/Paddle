@@ -1,16 +1,8 @@
-# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# 
+# 需要重点关注的是 锚点问题
+# 对于以前的 matmul + trivial_op 来说锚点只有 matmul 的输出 mmout
+# 现在  matmul + trivial_op + matmul 锚点就包括了 matmul1 的输出 tmp1 和 trivial_op 的输出 tmp2
+ 
 
 import abstract_drr
 import access_topo_drr  # noqa: F401
@@ -21,7 +13,9 @@ import kernel_arg_id_util
 import kernel_arg_translator_util  # noqa: F401
 import low_level_ir_code_gen_ctx_util  # noqa: F401
 import matmul_epilogue_pass
-import matmul_variadic_tpl
+
+import matmul_variadic_matmul_tpl
+
 import op_compute_translator_util
 import op_conversion_drr_pass  # noqa: F401
 import pir  # noqa: F401
@@ -30,23 +24,26 @@ import topo_drr_pass
 import umprime  # noqa: F401
 
 
-class MatmulEpilogueFusion(abstract_drr.DrrPass):
+class MatmulEpilogueMatmulFusion(abstract_drr.DrrPass):
     def source_pattern(self, o, t):
         in_num = self.number_of_inputs()
         out_num = self.number_of_outputs()
-        o.matmul_op = o.ap_native_op("pd_op.matmul")
-        o.matmul_op([t.input0, t.input1], [t.mm_out])
-        o.trivial_op = o.ap_trivial_fusion_op()
-        o.trivial_op(
-            [
-                t.mm_out,
-                *ap.map(
-                    lambda index: getattr(t, f"input{index+2}"),
-                    range(in_num - 2),
-                ),
-            ],
-            ap.map(lambda index: getattr(t, f"output{index}"), range(out_num)),
+                
+        o.matmul1 = o.ap_native_op("pd_op.matmul")
+        o.matmul1([t.input0, t.input1], [t.tmp1])
+        
+        # 注意：这里输入数量 = 2 (matmul1) + (varadic_op 的额外输入) + 1 (matmul2 的额外输入)
+        # 所以 varadic_op 的额外输入数量 = in_num - 3
+        varadic_inputs = [t.tmp1] + ap.map(
+            lambda index: getattr(t, f"input{index+2}"),
+            range(2, in_num - 1)  # 从 input2 到 input_{in_num-2}
         )
+        o.trivial_op = o.ap_trivial_fusion_op()
+        o.trivial_op(varadic_inputs, [t.tmp2])
+        
+        o.matmul2 = o.ap_native_op("pd_op.matmul")
+        o.matmul2([t.tmp2, t.input[in_num-1]], [t.output0])
+        
 
     def result_pattern(self, o, t):
         in_num = self.number_of_inputs()
@@ -56,18 +53,18 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
             ap.map(lambda index: getattr(t, f"input{index}"), range(in_num)),
             ap.map(lambda index: getattr(t, f"output{index}"), range(out_num)),
         )
-
+        
     def constraint(self, o, t):
-        program = ir_tools.copy_fused_ops_to_program(
-            o.trivial_op, tensor_match_ctx=t
-        )
-        print("before-umprime: ", program)
+        program = ir_tools.copy_fused_ops_to_program(o.trivial_op, tensor_match_ctx=t)        
+        print("[2Matmul Pass INFO] before-umprime: ", program)
+        
         # umprime passes
         pass_manager = ir_tools.create_pass_manager()
         pass_manager.add_pass(ir_tools.create_access_topo_drr_pass("umprime"))
         pass_manager.add_pass(ir_tools.create_dce_pass())
         pass_manager.run(program)
-        print("before-access_topo_pass", program)
+        print("[2Matmul Pass INFO] after-umprime & before-access_topo_pass", program)
+        
         init_pass_manager = ir_tools.create_pass_manager()
         init_down_spider = topo_drr_pass.InitDownSpiderAccessTopoPass("mm_out")
         init_pass_manager.add_pass(
@@ -81,7 +78,7 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
             if self.number_of_inputs() > 2
             else []
         )
-        print('inputs_name_list: ', ', '.join(inputs_name_list))
+        print('[2Matmul Pass INFO] inputs_name_list: ', ', '.join(inputs_name_list))
         init_fake_data_for_yield_input = (
             topo_drr_pass.FakeDataForYieldAccessTopoPass(outputs_name_list)
         )
@@ -91,12 +88,13 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
             )
         )
         init_pass_manager.run(program)
-        print("after-init-access_topo_pass", program)
+        print("[2Matmul Pass INFO] after-init-access_topo_pass", program)
+        
         pass_manager = ir_tools.create_pass_manager()
         pass_manager.add_pass(ir_tools.create_access_topo_drr_pass("default"))
         pass_manager.add_pass(ir_tools.create_dce_pass())
         pass_manager.run(program)
-        print("after-apply-access_topo_pass", program)
+        print("[2Matmul Pass INFO] after-apply-access_topo_pass", program)
         pass_manager = ir_tools.create_pass_manager()
         ap.map(
             lambda dst_name: pass_manager.add_pass(
@@ -118,7 +116,7 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
             ),
             inputs_name_list,
         )
-
+        
         ap.map(
             lambda dst_name: pass_manager.add_pass(
                 ir_tools.create_access_topo_drr_one_step_pass(
@@ -131,7 +129,7 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
         )
         pass_manager.add_pass(ir_tools.create_dce_pass())
         pass_manager.run(program)
-        print("after-remove-input-output-access_topo_pass", program)
+        print("[2Matmul Pass INFO] after-remove-input-output-access_topo_pass", program)
         return program.empty()
 
     def _insert_load_from_global(self, program, input_names):
@@ -194,7 +192,7 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
     ):
         full_index_program = compute_program.clone()
         self._apply_topo_access_passes(full_index_program, anchor_data_op_name)
-        print('full_index_program: ', full_index_program)
+        print('[2Matmul Pass INFO] full_index_program: ', full_index_program)
 
         def MatchAndCopyInputIndex(dst_input_name):
             pass_manager = ir_tools.create_pass_manager()
@@ -360,13 +358,13 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
         mut_kernel_arg_id_registry = kernel_arg_id_util.KernelArgIdNameRegistry(
             code_gen_ctx=ctx, tensor_match_ctx=t, name_prefix=""
         )
-        print('after registry')
+        print('[2Matmul Pass INFO] after registry')
 
-        template_module = matmul_variadic_tpl.MatmulVariadicTemplate(
+        template_module = matmul_variadic_matmul_tpl.MatmulVariadicMatmulTemplate(
             program_translator=program_translator,
             mut_kernel_arg_id_registry=mut_kernel_arg_id_registry,
         )
-        print('after module')
+        print('[2Matmul Pass INFO] after module')
 
         def get_symbolic_shape_args_list(sym_dim):
             return ctx.dim_expr_kernel_arg_id(sym_dim)
@@ -377,7 +375,7 @@ class MatmulEpilogueFusion(abstract_drr.DrrPass):
         input1_shape_kargs = ap.map(
             get_symbolic_shape_args_list, t.input1.symbolic_shape_to_list()
         )
-        print('before compile')
+        print('[2Matmul Pass INFO] before compile')
         return template_module.compile(
             input0_karg=ctx.in_tensor_data_ptr_kernel_arg_id(t.input0),
             input1_karg=ctx.in_tensor_data_ptr_kernel_arg_id(t.input1),
@@ -640,7 +638,7 @@ def get_mixin_class(base_class, number_of_inputs, number_of_outputs):
         NumberOfOutputsTrait22,
     ]
     return type(
-        f"MatmulEpilogueFusion{number_of_inputs}_{number_of_outputs}",
+        f"[2Matmul Pass INFO] MatmulEpilogueMatmulFusion{number_of_inputs}_{number_of_outputs}",
         [
             base_class,
             num_inputs_to_input_trait_class[number_of_inputs],
@@ -650,15 +648,13 @@ def get_mixin_class(base_class, number_of_inputs, number_of_outputs):
     )
 
 
-# abstract_drr.register_drr_pass("matmul_binary_outs_fusion", nice=0)(get_mixin_class(MatmulEpilogueFusion, 3, 2))
+# abstract_drr.register_drr_pass("matmul_binary_outs_fusion", nice=0)(get_mixin_class(MatmulEpilogueMatmulFusion, 3, 2))
 
 
-# 注册class； 
 def register_class(base_class, max_num_inputs, max_num_outputs):
     def register_drr_class(num_inputs, num_outputs):
-        # 写一个 pattern class 在这里注册，主要修改 Line 660
         abstract_drr.register_drr_pass(
-            f"matmul_binary_in{num_inputs}_out{num_outputs}_fusion", nice=0
+            f"[2Matmul Pass INFO] matmul_binary_epilogue_matmul_in{num_inputs}_out{num_outputs}_fusion", nice=0
         )(get_mixin_class(base_class, num_inputs, num_outputs))
 
     def register_num_inputs_drr_classes(num_inputs):
@@ -667,11 +663,11 @@ def register_class(base_class, max_num_inputs, max_num_outputs):
             return register_drr_class(num_inputs + 2, num_outputs + 1)
 
         ap.map(register_num_outputs_drr_classes, range(max_num_outputs))
-        print('done max outputs')
+        print('[2Matmul Pass INFO] done max outputs')
 
     ap.map(register_num_inputs_drr_classes, range(max_num_inputs))
 
 
 register_class(
-    base_class=MatmulEpilogueFusion, max_num_inputs=10, max_num_outputs=10
+    base_class=MatmulEpilogueMatmulFusion, max_num_inputs=10, max_num_outputs=10
 )
